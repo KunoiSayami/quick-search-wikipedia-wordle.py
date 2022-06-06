@@ -54,13 +54,13 @@ async def main(args: argparse.Namespace):
                         # print(title, pinyin)
                         await conn.execute(
                             """INSERT INTO "hanzi_wordle" VALUES ($1, $2)""",
-                            pinyin + "$",
+                            pinyin,
                             title,
                         )
                         count += 1
                         print(f"\r{count}", end="")
                 except json.JSONDecodeError:
-                    print(file)
+                    logging.warning("Got json decode error in %s", file)
                     continue
     await conn.close()
 

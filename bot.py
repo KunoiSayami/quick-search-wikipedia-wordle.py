@@ -25,29 +25,32 @@ config.read("config.ini")
 
 
 CJK = re.compile(r"[\u4e00-\u9fff]+")
-GOOD_QUERY = re.compile(r"^[\w\d[\u4e00-\u9fff]\s%\$'\"]+")
+# GOOD_QUERY = re.compile(r"^[\w\d[\u4e00-\u9fff]\s%\$'\"]+")
+PINYIN_QUERY = re.compile(r"^\??[a-z\d]*\??(\s\??[a-z\d]*\??)*$")
+CJK_QUERY = re.compile(r"^\??[\u4e00-\u9fff]+\??$")
 
 
 def generate_query_statement(count: int, args: list[str]) -> str:
     if len(CJK.findall(args[-1])):
-        query_chinese = args.pop(-1).replace("?", "%")
+        item = args.pop(-1)
+        if CJK_QUERY.match(item) is None:
+            raise ValueError("CJK")
+        query_chinese = item.replace("?", "%")
     else:
         query_chinese = ""
 
     if len(args) < count:
         args.extend(itertools.repeat("?", count - len(args)))
 
-    pinyin = " ".join(args).replace("?", "%") + "$"
+    pinyin = " ".join(args)
+    if PINYIN_QUERY.match(pinyin) is None:
+        raise ValueError("pinyin")
+    pinyin = pinyin.replace("?", "%")
 
     final_query = ""
     if len(query_chinese):
-        # WARNING: should avoid sqlite injection
         final_query = f"\"context\" LIKE '{query_chinese}' AND "
-    final_query += f"\"pinyin\" LIKE '{pinyin}'"
-    if GOOD_QUERY.match(final_query) is None:
-        print(final_query)
-        # raise ValueError
-    final_query += f' AND LENGTH("context")={count} LIMIT 10'
+    final_query += f'"pinyin" LIKE \'{pinyin}\' AND LENGTH("context")={count} LIMIT 10'
     return final_query
 
 
@@ -60,7 +63,7 @@ class BotController:
             bot_token=config.get("telegram", "token"),
         )
         self.bot.add_handler(
-            MessageHandler(self.search, filters.command("search") & filters.text)
+            MessageHandler(self.search, filters.command(["search", "s"]) & filters.text)
         )
         self.conn = conn
 
@@ -70,22 +73,26 @@ class BotController:
     async def stop(self) -> None:
         await self.bot.stop()
 
-    async def search(self, client: Client, msg: Message) -> None:
+    async def search(self, _client: Client, msg: Message) -> None:
         if len(msg.command) <= 2:
-            await msg.reply("///")
+            await msg.reply("usage: /search <length> [pinyin(with ?) ...] [CJK(with ?)]")
             msg.continue_propagation()
         try:
             count = int(msg.command[1])
         except ValueError:
-            await msg.reply("number error")
+            await msg.reply("Length error")
             return msg.continue_propagation()
         if count <= 2:
-            await msg.reply("Num")
-        query = generate_query_statement(int(msg.command[1]), msg.command[2:])
+            await msg.reply("Length should more than 2")
+        try:
+            query = generate_query_statement(int(msg.command[1]), msg.command[2:])
+        except ValueError as e:
+            await msg.reply(f"Got bad query option, please check section: {e.args[0]}")
+            return msg.continue_propagation()
         logging.debug("Query => %s", query)
         ret = await self.conn.query("""SELECT * FROM "hanzi_wordle" WHERE """ + query)
-        if len(ret) > 1:
-            await msg.reply("\n".join(map(lambda x: x['context'], ret)))
+        if len(ret):
+            await msg.reply("\n".join(map(lambda x: x["context"], ret)))
         else:
             await msg.reply("not found")
 
