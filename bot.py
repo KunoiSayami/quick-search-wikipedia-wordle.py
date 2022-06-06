@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 import asyncio
-import argparse
 import itertools
-import json
-import pathlib
 import re
-import os
-import sys
 import logging
 from configparser import ConfigParser
 
-import pypinyin
-import aiofiles
 import pyrogram
 from pyrogram import Client, filters
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, EditedMessageHandler
 from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
 from libpy3 import aiopgsqldb
 
@@ -26,12 +20,22 @@ config.read("config.ini")
 
 CJK = re.compile(r"[\u4e00-\u9fff]+")
 # GOOD_QUERY = re.compile(r"^[\w\d[\u4e00-\u9fff]\s%\$'\"]+")
-PINYIN_QUERY = re.compile(r"^\??[a-z\d]*\??(\s\??[a-z\d]*\??)*$")
+PINYIN_QUERY = re.compile(r"^[a-z\d?]+(\s[a-z\d?]+)*$")
+STRICT_PINYIN_QUERY = re.compile(r"^[a-z]*\d?$")
 CJK_QUERY = re.compile(r"^\??[\u4e00-\u9fff]+\??$")
 
 
+def generate_fuzzy_statement(args: list[str], count: int, query_args: list[str]) -> str:
+    if not all((STRICT_PINYIN_QUERY.match(x) for x in args)):
+        raise ValueError("Fuzzy")
+    search = generate_query_statement(count, query_args)
+    args = list(map(lambda x: f"\"pinyin\" LIKE '%{x}%'", args))
+    args.append(search)
+    return " AND ".join(args)
+
+
 def generate_query_statement(count: int, args: list[str]) -> str:
-    if len(CJK.findall(args[-1])):
+    if len(args) and len(CJK.findall(args[-1])):
         item = args.pop(-1)
         if CJK_QUERY.match(item) is None:
             raise ValueError("CJK")
@@ -65,6 +69,21 @@ class BotController:
         self.bot.add_handler(
             MessageHandler(self.search, filters.command(["search", "s"]) & filters.text)
         )
+        self.bot.add_handler(
+            EditedMessageHandler(
+                self.search, filters.command(["search", "s"]) & filters.text
+            )
+        )
+        self.bot.add_handler(
+            MessageHandler(
+                self.fuzzy_search, filters.command(["fuzzy", "f"]) & filters.text
+            )
+        )
+        self.bot.add_handler(
+            EditedMessageHandler(
+                self.fuzzy_search, filters.command(["fuzzy", "f"]) & filters.text
+            )
+        )
         self.conn = conn
 
     async def start(self) -> None:
@@ -75,7 +94,9 @@ class BotController:
 
     async def search(self, _client: Client, msg: Message) -> None:
         if len(msg.command) <= 2:
-            await msg.reply("usage: /search <length> [pinyin(with ?) ...] [CJK(with ?)]")
+            await msg.reply(
+                "usage: /search <length> [pinyin(with ?) ...] [CJK(with ?)]"
+            )
             msg.continue_propagation()
         try:
             count = int(msg.command[1])
@@ -88,13 +109,45 @@ class BotController:
             query = generate_query_statement(int(msg.command[1]), msg.command[2:])
         except ValueError as e:
             await msg.reply(f"Got bad query option, please check section: {e.args[0]}")
+            logging.warning("Got bad query: %s", msg.command)
             return msg.continue_propagation()
+        await self.query(msg, query)
+
+    async def query(self, msg: Message, query: str) -> None:
         logging.debug("Query => %s", query)
         ret = await self.conn.query("""SELECT * FROM "hanzi_wordle" WHERE """ + query)
         if len(ret):
-            await msg.reply("\n".join(map(lambda x: x["context"], ret)))
+            await msg.reply("\n".join(map(lambda x: f'`{x["context"]}`', ret)), parse_mode=ParseMode.MARKDOWN)
         else:
             await msg.reply("not found")
+
+    async def fuzzy_search(self, _client: Client, msg: Message) -> None:
+        if len(msg.command) <= 4:
+            await msg.reply(
+                "usage: /fuzzy <item ...> $ <length> [pinyin(with ?) ...] [CJK(with ?)]")
+            msg.continue_propagation()
+        if not any((x == "$" for x in msg.command)):
+            await msg.reply("Delimiter($) should be used")
+            msg.continue_propagation()
+        if (sep := msg.command.index("$")) == len(msg.command) - 1:
+            await msg.reply("Should end with length")
+            msg.continue_propagation()
+        try:
+            count = int(msg.command[sep + 1])
+            if count < 2:
+                raise ValueError
+        except ValueError:
+            await msg.reply("Length is not a valid number")
+            return msg.continue_propagation()
+        try:
+            query = generate_fuzzy_statement(
+                msg.command[1:sep], count, msg.command[sep + 2:]
+            )
+        except ValueError as e:
+            await msg.reply(f"Got bad query option, please check section: {e.args[0]}")
+            logging.warning("Got bad query: %s", msg.command)
+            return msg.continue_propagation()
+        await self.query(msg, query)
 
 
 async def main():
